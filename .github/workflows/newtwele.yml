@@ -1,0 +1,59 @@
+name: rdp-tailscale12
+on:
+  workflow_dispatch:
+
+jobs:
+  rdp:
+    runs-on: windows-latest
+    timeout-minutes: 360
+    steps:
+      - name: Preflight (check Tailscale secret)
+        shell: pwsh
+        env:
+          TSKEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
+        run: |
+          if (-not $env:TSKEY -or $env:TSKEY.Trim().Length -eq 0) {
+            throw "Missing TAILSCALE_AUTH_KEY secret."
+          }
+
+      - name: Enable RDP & open firewall
+        shell: pwsh
+        run: |
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name 'fDenyTSConnections' -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name 'UserAuthentication' -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name 'SecurityLayer' -Value 0 -Force
+          netsh advfirewall firewall delete rule name='RDP-GHA' | Out-Null
+          netsh advfirewall firewall add rule name='RDP-GHA' dir=in action=allow protocol=TCP localport=3389
+          Set-Service -Name 'TermService' -StartupType Automatic
+          Restart-Service -Name 'TermService' -Force
+
+      - name: Create RDP user (kunal / Amit@2525)
+        shell: pwsh
+        run: |
+          $user = 'kunal'
+          $pass = 'Amit@2525'
+          $secure = ConvertTo-SecureString $pass -AsPlainText -Force
+          if (-not (Get-LocalUser -Name $user -ErrorAction SilentlyContinue)) {
+            New-LocalUser -Name $user -Password $secure -PasswordNeverExpires:$true -UserMayNotChangePassword:$true | Out-Null
+          } else {
+            Set-LocalUser -Name $user -Password $secure
+          }
+          Add-LocalGroupMember -Group 'Remote Desktop Users' -Member $user -ErrorAction SilentlyContinue
+          "## RDP Credentials`nUsername: $user`nPassword: $pass" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Append
+
+      - name: Install & connect Tailscale
+        shell: pwsh
+        env:
+          TSKEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
+        run: |
+          Invoke-WebRequest 'https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi' -OutFile ts.msi
+          Start-Process msiexec.exe -Wait -ArgumentList '/i ts.msi /qn'
+          $ts = 'C:\Program Files\Tailscale\tailscale.exe'
+          & $ts up --authkey $env:TSKEY --hostname "gha-${{ github.run_id }}" --accept-routes --accept-dns=false --ssh=false
+          $ip4 = & $ts ip -4
+          "## Tailscale`nIPv4: $ip4`nConnect via mstsc to this IP." | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Append
+
+      - name: Keep alive (max 6h)
+        shell: pwsh
+        run: |
+          1..360 | ForEach-Object { Write-Host "Minutes remaining: $((360)-$_)"; Start-Sleep -Seconds 60 }
